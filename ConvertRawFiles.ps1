@@ -28,8 +28,8 @@ $FIXMSMS_MSCONVERT = ".\scripts\fixMSMSPrecursor.py"
 
 # Get parameters
 #---------------------------
-$raw_data_folder = ".\testRaw"
-$output_folder = "./testmzML"
+$raw_data_folder = "..\"
+$output_folder = "..\mzMLs"
 # Prompt user for raw_data_folder
 Write-Host -------------------------------------------------------------------------------
 Write-Host "Which folder contains the raw data files?"
@@ -53,8 +53,8 @@ Write-Host "`n"
 Write-Host -------------------------------------------------------------------------------
 Write-Host "Which converter do you want to use for file conversion?"
 Write-Host "Possible values:"
-Write-Host "   - DEFAULT 2 - MSConvert (can generate FPS, positive, and negative mode datasets)"
-Write-Host "   -         1 - ThermoRawFileParser (generates only FPS data)"
+Write-Host "   - DEFAULT 1 - ThermoRawFileParser (generates only FPS data)"
+Write-Host "   -         2 - MSConvert (can generate FPS, positive, and negative mode datasets)"
 $progc = Read-Host "Enter 1 or 2 (press Enter for default)"
 if (-not $progc) {
     $progc = "1"
