@@ -30,14 +30,9 @@ def commentWrongPrecursorInfo(file, newFileExtension=""):
         toDel.append(tag)
         tag.decompose()
         # tag.replace_with(bs4.Comment(str(tag)))
-    print(
-        "      .. commented %d precursor information tags (selected ion m/z)"
-        % (len(toDel))
-    )
+    print("      .. commented %d precursor information tags (selected ion m/z)" % (len(toDel)))
 
-    with open(
-        file.replace(".mzML", "%s.mzML" % (newFileExtension)), "w", newline="\n"
-    ) as fout:
+    with open(file.replace(".mzML", "%s.mzML" % (newFileExtension)), "w", newline="\n") as fout:
         fout.write(
             re.sub(
                 "<binary>\\s*(.*)\\s*</binary>",
@@ -83,22 +78,13 @@ def correctWrongPrecursorInfo(file, new_file_suffix="", ppm_dev=1.0):
             isoMZV = float(isoMZ[0]["value"])
 
             if abs(selMZV - isoMZV) / isoMZV * 1e6 >= ppm_dev:
-                print(
-                    "      .. incorrect 'selected ion m/z' %.5f, correcting to 'isolation window target m/z' %.5f"
-                    % (selMZV, isoMZV)
-                )
+                print("      .. incorrect 'selected ion m/z' %.5f, correcting to 'isolation window target m/z' %.5f" % (selMZV, isoMZV))
                 selMZ[0]["value"] = isoMZV
                 changedMSMSScans += 1
         else:
-            raise RuntimeError(
-                "There are 0 or more than 1 tag of 'selected ion m/z' or 'isolation window target m/z' for the tag: '%s'"
-                % (tag)
-            )
+            raise RuntimeError("There are 0 or more than 1 tag of 'selected ion m/z' or 'isolation window target m/z' for the tag: '%s'" % (tag))
 
-    print(
-        "      .. corrected %d precursor information tags ('selected ion m/z' replaced with 'isolation window target m/z')"
-        % (changedMSMSScans)
-    )
+    print("      .. corrected %d precursor information tags ('selected ion m/z' replaced with 'isolation window target m/z')" % (changedMSMSScans))
 
     output_file = file
     if new_file_suffix != "" and new_file_suffix != "::SAME":
@@ -114,9 +100,7 @@ def correctWrongPrecursorInfo(file, new_file_suffix="", ppm_dev=1.0):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Correct selected ion m/z tags in mzML files."
-    )
+    parser = argparse.ArgumentParser(description="Correct selected ion m/z tags in mzML files.")
     parser.add_argument(
         "--file",
         type=str,
@@ -143,27 +127,20 @@ if __name__ == "__main__":
 
     print("Correcting 'selected ion m/z' tags from mzML files in '%s'" % (path))
     if new_file_suffix != "" and new_file_suffix != "::SAME":
-        print(
-            "   .. adding the file extension '%s'.mzML to the corrected files"
-            % new_file_suffix
-        )
+        print("   .. adding the file extension '%s'.mzML to the corrected files" % new_file_suffix)
     else:
         print("   .. files will be overwritten")
     print("   .. using a ppm deviation of %.2f" % ppm_dev)
 
     if isfile(path) and path.lower().endswith(".mzml"):
         print("   .. processing file '%s'" % (path))
-        correctWrongPrecursorInfo(
-            path, new_file_suffix=new_file_suffix, ppm_dev=ppm_dev
-        )
+        correctWrongPrecursorInfo(path, new_file_suffix=new_file_suffix, ppm_dev=ppm_dev)
 
     elif not isfile(path):
         for file in listdir(path):
             if isfile(join(path, file)) and file.lower().endswith(".mzml"):
                 print("   .. processing file '%s'" % (file))
-                correctWrongPrecursorInfo(
-                    join(path, file), new_file_suffix=new_file_suffix, ppm_dev=ppm_dev
-                )
+                correctWrongPrecursorInfo(join(path, file), new_file_suffix=new_file_suffix, ppm_dev=ppm_dev)
     else:
         print("given --file '%s' is not a file or does not end with '.mzml'" % (path))
 

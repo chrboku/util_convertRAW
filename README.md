@@ -21,9 +21,7 @@ that of 'isolation window target m/z'.
       +- README.txt
       +- ConvertAllRawInParentDirectory.bat
 
-3. Execute the script convertRaw\ConvertAllRawInParentDirectory.ps1 by right-clicking it and 
-   then select "Run with PowerShell"
-   A command line prompt will open.
+3. Double-click the file "run.bat" to start the app
 
 4. Specify the new extension to be used for the corrected MSMS precursor files. 
    Leave blank to not generate a separate file but directly correct the converted mzML files. 
