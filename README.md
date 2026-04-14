@@ -10,21 +10,21 @@ that of 'isolation window target m/z'.
 
 2. Copy the entire folder to the path where the raw files to be converted are located. 
    The structure should be 
+```
    folder
-   +- raw-file1.raw
-   +- raw-file2.raw
-   +- ...
-   +- raw-filen.raw
-   +- convertRAW
-      +- help
-      +- ...
-      +- README.txt
-      +- ConvertAllRawInParentDirectory.bat
+     +- raw-file1.raw
+     +- raw-file2.raw
+     +- ...
+     +- raw-filen.raw
+     +- folder
+          +- raw-filex.raw
+     +- util_convertRAW
+          +- run.bat
+```
 
 3. Double-click the file "run.bat" to start the app
 
-4. Specify the new extension to be used for the corrected MSMS precursor files. 
-   Leave blank to not generate a separate file but directly correct the converted mzML files. 
+4. Follow the instructions in the terminal.
 
 5. Wait until finished
 

@@ -1,21 +1,105 @@
 import sys
 import shutil
 import subprocess
+import tarfile
+import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
+import toml
+
+# Import correction helper directly (same project)
+from .fixMSMSPrecursor import correctWrongPrecursorInfo  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths relative to this script
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent.parent.parent.resolve()
-print(f"Script directory: {SCRIPT_DIR}")
 
-MSCONVERT = SCRIPT_DIR / "sw" / "pwiz-bin-windows-x86_64-vc143-release-3_0_23163_09bc765" / "msconvert.exe"
-THERMOCONVERT = SCRIPT_DIR / "sw" / "ThermoRawFileParser1.4.2" / "ThermoRawFileParser.exe"
+MSCONVERT_LINK = "https://mc-tca-01.s3.us-west-2.amazonaws.com/ProteoWizard/bt83/3934453/pwiz-bin-windows-x86_64-vc145-release-3_0_26102_0783ec5.tar.bz2"
+MSCONVERT = SCRIPT_DIR / "sw" / "ProteoWizard-x86_64-vc145-release-3_0_26102_0783ec5" / "msconvert.exe"
 
-# Import correction helper directly (same project)
-from .fixMSMSPrecursor import correctWrongPrecursorInfo  # noqa: E402
+THERMOCONVERT_LINK = "https://github.com/CompOmics/ThermoRawFileParser/releases/download/v.2.0.0-dev/ThermoRawFileParser-v.2.0.0-dev-win.zip"
+THERMOCONVERT = SCRIPT_DIR / "sw" / "ThermoRawFileParser_2.2.0-dev-win" / "ThermoRawFileParser.exe"
 
 SEP = "-" * 79
+
+
+# ---------------------------------------------------------------------------
+# Download / install helpers
+# ---------------------------------------------------------------------------
+
+
+def _download_with_progress(url: str, dest: Path, label: str) -> None:
+    """Download *url* to *dest*, printing a simple progress indicator."""
+
+    def _report(block_count: int, block_size: int, total_size: int) -> None:
+        if total_size > 0:
+            pct = min(100, block_count * block_size * 100 // total_size)
+            print(f"\r    Downloading {label}: {pct:3d}%", end="", flush=True)
+        else:
+            downloaded = block_count * block_size
+            print(f"\r    Downloading {label}: {downloaded // 1024} KB", end="", flush=True)
+
+    print(f"  Downloading {label} from:")
+    print(f"    {url}")
+    urllib.request.urlretrieve(url, dest, reporthook=_report)
+    print()  # newline after progress
+
+
+def _install_thermoconvert() -> bool:
+    """Download and unpack ThermoRawFileParser into its own subfolder under sw/."""
+    target_dir = THERMOCONVERT.parent  # sw/ThermoRawFileParser1.4.2/
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / Path(THERMOCONVERT_LINK.split("/")[-1])
+        try:
+            _download_with_progress(THERMOCONVERT_LINK, archive, "ThermoRawFileParser")
+        except Exception as exc:
+            print(f"  ERROR: Download failed: {exc}")
+            return False
+        print(f"  Extracting to {target_dir} ...")
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(target_dir)
+        except Exception as exc:
+            print(f"  ERROR: Extraction failed: {exc}")
+            return False
+    if not THERMOCONVERT.exists():
+        print(f"  ERROR: ThermoRawFileParser.exe not found after extraction at {THERMOCONVERT}")
+        return False
+    print("  ThermoRawFileParser installed successfully.")
+    return True
+
+
+def _install_msconvert() -> bool:
+    """Download and unpack MSConvert (ProteoWizard) into its own subfolder under sw/."""
+    target_dir = MSCONVERT.parent  # sw/<versioned-dirname>/
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / Path(MSCONVERT_LINK.split("/")[-1])
+        try:
+            _download_with_progress(MSCONVERT_LINK, archive, "MSConvert (ProteoWizard)")
+        except Exception as exc:
+            print(f"  ERROR: Download failed: {exc}")
+            return False
+        print(f"  Extracting to {target_dir} ...")
+        try:
+            with tarfile.open(archive, "r:bz2") as tf:
+                # Strip the top-level directory from the archive so files land
+                # directly in target_dir (the versioned subfolder we created).
+                for member in tf.getmembers():
+                    parts = Path(member.name).parts
+                    member.name = str(Path(*parts[1:])) if len(parts) > 1 else member.name
+                tf.extractall(target_dir)
+        except Exception as exc:
+            print(f"  ERROR: Extraction failed: {exc}")
+            return False
+    if not MSCONVERT.exists():
+        print(f"  ERROR: msconvert.exe not found after extraction at {MSCONVERT}")
+        return False
+    print("  MSConvert installed successfully.")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +189,6 @@ def fix_msms(mzml_file: Path, new_file_suffix: str, ppm_dev: float) -> None:
 def get_version() -> str:
     # Get version from TOML file
     try:
-        import toml
-
         version_info = toml.load(SCRIPT_DIR / "pyproject.toml")["project"]["version"]
         return version_info
     except Exception as exc:
@@ -126,24 +208,69 @@ def main() -> None:
     print(f"Version: {get_version()}")
     print()
 
-    # check for tools
-    missing_tool = False
-    if not THERMOCONVERT.exists():
-        print(f"ERROR: ThermoRawFileParser not found at expected location: {THERMOCONVERT}")
-        print("Please ensure the converter is downloaded and placed in the 'sw' subfolder.")
-        missing_tool = True
-    else:
-        print(f"Found ThermoRawFileParser: {THERMOCONVERT}")
+    # check for tools — offer to download when missing
+    def _check_and_offer_download() -> bool:
+        """Return True when both tools are present.  If any are missing, ask the
+        user whether they want to download them (informing them of the size),
+        then attempt the download and return True on success."""
+        missing: list[str] = []
+        if not THERMOCONVERT.exists():
+            missing.append("ThermoRawFileParser (~10 MB)")
+        if not MSCONVERT.exists():
+            missing.append("MSConvert / ProteoWizard (~190 MB)")
 
-    if not MSCONVERT.exists():
-        print(f"ERROR: MSConvert not found at expected location: {MSCONVERT}")
-        print("Please ensure the converter is downloaded and placed in the 'sw' subfolder.")
-        missing_tool = True
-    else:
-        print(f"Found MSConvert: {MSCONVERT}")
+        if not missing:
+            print(f"  [OK] ThermoRawFileParser: {THERMOCONVERT}")
+            print(f"  [OK] MSConvert: {MSCONVERT}")
+            return True
 
-    if missing_tool:
-        sys.exit(1)
+        # Report what is missing
+        print()
+        print(SEP)
+        print("The following required tools were not found:")
+        for item in missing:
+            print(f"    - {item}")
+        total_note = "  Total download size: approximately 200 MB." if len(missing) == 2 else ""
+        if total_note:
+            print(total_note)
+        print()
+        print("  y - Download and install the missing tools automatically  [DEFAULT]")
+        print("  n - Quit (install them manually and re-run the program)")
+        choice = input("  [y/n] > ").strip().lower()
+        print()
+        if choice == "n":
+            print("Aborted. Please place the tools in the expected locations and re-run.")
+            print(f"  ThermoRawFileParser: {THERMOCONVERT}")
+            print(f"  MSConvert:           {MSCONVERT}")
+            input("\nPress Enter to exit.")
+            sys.exit(0)
+
+        # Download what is needed
+        ok = True
+        if not THERMOCONVERT.exists():
+            print()
+            if not _install_thermoconvert():
+                ok = False
+            else:
+                print(f"  [OK] ThermoRawFileParser: {THERMOCONVERT}")
+        if not MSCONVERT.exists():
+            print()
+            if not _install_msconvert():
+                ok = False
+            else:
+                print(f"  [OK] MSConvert: {MSCONVERT}")
+        return ok
+
+    while not _check_and_offer_download():
+        print(SEP)
+        print("Download/installation failed for one or more tools (see errors above).")
+        print("  r - Retry download")
+        print("  q - Quit")
+        choice = input("  [r/q] > ").strip().lower()
+        print()
+        if choice == "q":
+            sys.exit(1)
+        # else retry the loop
 
     print("\n\n")
     print(SEP)
