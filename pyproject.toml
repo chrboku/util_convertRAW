@@ -1,6 +1,6 @@
 [project]
 name = "util-convertraw"
-version = "2.1.0"
+version = "3.0.0"
 description = "Convert Thermo raw files and correct incorrect MSMS precursor information."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -8,6 +8,7 @@ dependencies = [
     "beautifulsoup4",
     "lxml",
     "toml>=0.10.2",
+    "textual>=0.70.0",
 ]
 
 [project.scripts]

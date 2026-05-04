@@ -1,28 +1,93 @@
-import sys
 import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import urllib.request
 import zipfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
 import toml
 
-# Import correction helper directly (same project)
 from .fixMSMSPrecursor import correctWrongPrecursorInfo  # noqa: E402
+from .prefixTimestamp import prefix_mzml_with_timestamp  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Paths relative to this script
+# Paths
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).parent.parent.parent.resolve()
 
-MSCONVERT_LINK = "https://mc-tca-01.s3.us-west-2.amazonaws.com/ProteoWizard/bt83/3934453/pwiz-bin-windows-x86_64-vc145-release-3_0_26102_0783ec5.tar.bz2"
-MSCONVERT = SCRIPT_DIR / "sw" / "ProteoWizard-x86_64-vc145-release-3_0_26102_0783ec5" / "msconvert.exe"
+# ---------------------------------------------------------------------------
+# Tool version registry
+# Each entry: {"label": str, "url": str, "exe_rel": str, "archive_type": "zip"|"tar.bz2"}
+# exe_rel is the path of the executable *relative to the sw/ folder*.
+# Add new versions by appending to these lists — the TUI will show them.
+# ---------------------------------------------------------------------------
 
-THERMOCONVERT_LINK = "https://github.com/CompOmics/ThermoRawFileParser/releases/download/v.2.0.0-dev/ThermoRawFileParser-v.2.0.0-dev-win.zip"
-THERMOCONVERT = SCRIPT_DIR / "sw" / "ThermoRawFileParser_2.2.0-dev-win" / "ThermoRawFileParser.exe"
+THERMOCONVERT_VERSIONS: list[dict] = [
+    {
+        "label": "ThermoRawFileParser v2.0.0-dev",
+        "url": "https://github.com/CompOmics/ThermoRawFileParser/releases/download/v.2.0.0-dev/ThermoRawFileParser-v.2.0.0-dev-win.zip",
+        "exe_rel": "ThermoRawFileParser_2.0.0-dev-win/ThermoRawFileParser.exe",
+        "archive_type": "zip",
+    },
+    {
+        "label": "ThermoRawFileParser v1.4.5",
+        "url": "https://github.com/CompOmics/ThermoRawFileParser/releases/download/v1.4.5/ThermoRawFileParser1.4.5.zip",
+        "exe_rel": "ThermoRawFileParser_1.4.5/ThermoRawFileParser.exe",
+        "archive_type": "zip",
+    },
+    {
+        "label": "ThermoRawFileParser v1.4.3",
+        "url": "https://github.com/CompOmics/ThermoRawFileParser/releases/download/v1.4.3/ThermoRawFileParser1.4.3.zip",
+        "exe_rel": "ThermoRawFileParser_1.4.3/ThermoRawFileParser.exe",
+        "archive_type": "zip",
+    },
+]
+
+MSCONVERT_VERSIONS: list[dict] = [
+    {
+        "label": "MSConvert / ProteoWizard 3.0.26123",
+        "url": "https://mc-tca-01.s3.us-west-2.amazonaws.com/ProteoWizard/bt83/3969548/pwiz-bin-windows-x86_64-vc145-release-3_0_26123_e5a25cb.tar.bz2",
+        "exe_rel": "ProteoWizard-x86_64-vc145-release-3_0_26123_e5a25cb/msconvert.exe",
+        "archive_type": "tar.bz2",
+    },
+    #{
+    #    "label": "MSConvert / ProteoWizard 3.0.26102",
+    #    "url": "https://mc-tca-01.s3.us-west-2.amazonaws.com/ProteoWizard/bt83/3934453/pwiz-bin-windows-x86_64-vc145-release-3_0_26102_0783ec5.tar.bz2",
+    #    "exe_rel": "ProteoWizard-x86_64-vc145-release-3_0_26102_0783ec5/msconvert.exe",
+    #    "archive_type": "tar.bz2",
+    #},
+    #{
+    #    "label": "MSConvert / ProteoWizard 3.0.25149",
+    #    "url": "https://mc-tca-01.s3.us-west-2.amazonaws.com/ProteoWizard/bt83/3813985/pwiz-bin-windows-x86_64-vc145-release-3_0_25149_2e8a3d7.tar.bz2",
+    #    "exe_rel": "ProteoWizard-x86_64-vc145-release-3_0_25149_2e8a3d7/msconvert.exe",
+    #    "archive_type": "tar.bz2",
+    #},
+]
+
+
+def get_tool_paths(thermo_idx: int = 0, msconvert_idx: int = 0) -> tuple[Path, Path]:
+    """Return (thermoconvert_exe, msconvert_exe) for the given version indices."""
+    t = THERMOCONVERT_VERSIONS[thermo_idx]
+    m = MSCONVERT_VERSIONS[msconvert_idx]
+    return (
+        SCRIPT_DIR / "sw" / t["exe_rel"],
+        SCRIPT_DIR / "sw" / m["exe_rel"],
+    )
+
 
 SEP = "-" * 79
+_print_lock = threading.Lock()
+
+
+def log_append(log: list[str] | None, msg: str) -> None:
+    if log is None:
+        print(msg)
+    else:
+        log.append(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -30,93 +95,81 @@ SEP = "-" * 79
 # ---------------------------------------------------------------------------
 
 
-def _download_with_progress(url: str, dest: Path, label: str) -> None:
-    """Download *url* to *dest*, printing a simple progress indicator."""
-
+def _download_with_progress(url: str, dest: Path, label: str, progress_cb: Callable[[str], None] | None = None) -> None:
     def _report(block_count: int, block_size: int, total_size: int) -> None:
         if total_size > 0:
             pct = min(100, block_count * block_size * 100 // total_size)
-            print(f"\r    Downloading {label}: {pct:3d}%", end="", flush=True)
+            msg = f"Downloading {label}: {pct:3d}%"
         else:
             downloaded = block_count * block_size
-            print(f"\r    Downloading {label}: {downloaded // 1024} KB", end="", flush=True)
+            msg = f"Downloading {label}: {downloaded // 1024} KB"
+        if progress_cb:
+            progress_cb(msg)
+        else:
+            print(f"\r    {msg}", end="", flush=True)
 
-    print(f"  Downloading {label} from:")
-    print(f"    {url}")
+    if progress_cb:
+        progress_cb(f"Starting download: {label}")
+    else:
+        print(f"  Downloading {label} from:\n    {url}")
     urllib.request.urlretrieve(url, dest, reporthook=_report)
-    print()  # newline after progress
+    if not progress_cb:
+        print()
 
 
-def _install_thermoconvert() -> bool:
-    """Download and unpack ThermoRawFileParser into its own subfolder under sw/."""
-    target_dir = THERMOCONVERT.parent  # sw/ThermoRawFileParser1.4.2/
+def install_tool(version_entry: dict, progress_cb: Callable[[str], None] | None = None) -> tuple[bool, str]:
+    """
+    Download and install a tool from *version_entry*.
+    Returns (success, message).
+    """
+    exe_path = SCRIPT_DIR / "sw" / version_entry["exe_rel"]
+    target_dir = exe_path.parent
     target_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as tmp:
-        archive = Path(tmp) / Path(THERMOCONVERT_LINK.split("/")[-1])
-        try:
-            _download_with_progress(THERMOCONVERT_LINK, archive, "ThermoRawFileParser")
-        except Exception as exc:
-            print(f"  ERROR: Download failed: {exc}")
-            return False
-        print(f"  Extracting to {target_dir} ...")
-        try:
-            with zipfile.ZipFile(archive) as zf:
-                zf.extractall(target_dir)
-        except Exception as exc:
-            print(f"  ERROR: Extraction failed: {exc}")
-            return False
-    if not THERMOCONVERT.exists():
-        print(f"  ERROR: ThermoRawFileParser.exe not found after extraction at {THERMOCONVERT}")
-        return False
-    print("  ThermoRawFileParser installed successfully.")
-    return True
+    url: str = version_entry["url"]
+    archive_type: str = version_entry["archive_type"]
+    label: str = version_entry["label"]
 
-
-def _install_msconvert() -> bool:
-    """Download and unpack MSConvert (ProteoWizard) into its own subfolder under sw/."""
-    target_dir = MSCONVERT.parent  # sw/<versioned-dirname>/
-    target_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
-        archive = Path(tmp) / Path(MSCONVERT_LINK.split("/")[-1])
+        archive = Path(tmp) / Path(url.split("/")[-1])
         try:
-            _download_with_progress(MSCONVERT_LINK, archive, "MSConvert (ProteoWizard)")
+            _download_with_progress(url, archive, label, progress_cb)
         except Exception as exc:
-            print(f"  ERROR: Download failed: {exc}")
-            return False
-        print(f"  Extracting to {target_dir} ...")
+            return False, f"Download failed: {exc}"
+
+        if progress_cb:
+            progress_cb(f"Extracting {label} ...")
+        else:
+            print(f"  Extracting to {target_dir} ...")
+
         try:
-            with tarfile.open(archive, "r:bz2") as tf:
-                # Strip the top-level directory from the archive so files land
-                # directly in target_dir (the versioned subfolder we created).
-                for member in tf.getmembers():
-                    parts = Path(member.name).parts
-                    member.name = str(Path(*parts[1:])) if len(parts) > 1 else member.name
-                tf.extractall(target_dir)
+            if archive_type == "zip":
+                with zipfile.ZipFile(archive) as zf:
+                    zf.extractall(target_dir)
+            elif archive_type == "tar.bz2":
+                with tarfile.open(archive, "r:bz2") as tf:
+                    for member in tf.getmembers():
+                        parts = Path(member.name).parts
+                        member.name = str(Path(*parts[1:])) if len(parts) > 1 else member.name
+                    tf.extractall(target_dir)
+            else:
+                return False, f"Unknown archive type: {archive_type}"
         except Exception as exc:
-            print(f"  ERROR: Extraction failed: {exc}")
-            return False
-    if not MSCONVERT.exists():
-        print(f"  ERROR: msconvert.exe not found after extraction at {MSCONVERT}")
-        return False
-    print("  MSConvert installed successfully.")
-    return True
+            return False, f"Extraction failed: {exc}"
+
+    if not exe_path.exists():
+        return False, f"Executable not found after extraction: {exe_path}"
+
+    msg = f"{label} installed at {exe_path}"
+    if progress_cb:
+        progress_cb(msg)
+    else:
+        print(f"  {msg}")
+    return True, msg
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Conversion helpers
 # ---------------------------------------------------------------------------
-
-
-def _ask(default: str) -> str:
-    """Prompt with a default value; return default when user hits Enter."""
-    answer = input(f"  [default: {default}] > ").strip()
-    return answer if answer else default
-
-
-def _ask_choice(choices: list[str], default: str) -> str:
-    """Prompt for one of a fixed set of choice strings; default returned on Enter or invalid input."""
-    answer = input(f"  [{'/'.join(choices)}] > ").strip()
-    return answer if answer in choices else default
 
 
 def collect_raw_files(source_folder: Path, recursive: bool) -> list[Path]:
@@ -129,323 +182,296 @@ def ensure_dir(path: Path) -> None:
 
 
 def output_dir_for(raw_file: Path, source_folder: Path, output_base: Path, mode_subdir: str) -> Path:
-    """Mirror the relative sub-path of *raw_file* under *output_base/mode_subdir*."""
     rel_parent = raw_file.relative_to(source_folder).parent
     return output_base / mode_subdir / rel_parent
 
 
-def convert_thermo(raw_file: Path, out_dir: Path) -> None:
+def convert_thermo(raw_file: Path, out_dir: Path, thermoconvert: Path, log: list[str] | None = None) -> None:
     ensure_dir(out_dir)
-    cmd = [
-        str(THERMOCONVERT),
-        "-f",
-        "1",
-        "-a",
-        "-e",
-        "-x",
-        "-i",
-        str(raw_file),
-        "-o",
-        str(out_dir),
-    ]
-    print(f"  Converting (ThermoRawFileParser): {raw_file.name}")
-    result = subprocess.run(cmd)
+    cmd = [str(thermoconvert), "-f", "1", "-a", "-e", "-x", "-i", str(raw_file), "-o", str(out_dir)]
+    log_append(log, f"  Converting (ThermoRawFileParser): {raw_file.name}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    for line in (result.stdout or "").splitlines():
+        log_append(log, f"    {line}")
+    for line in (result.stderr or "").splitlines():
+        log_append(log, f"    {line}")
     if result.returncode != 0:
-        print(f"  WARNING: Converter returned exit code {result.returncode} for '{raw_file.name}'")
+        log_append(log, f"  WARNING: Converter returned exit code {result.returncode} for '{raw_file.name}'")
 
 
-def convert_msconvert(raw_file: Path, out_dir: Path, polarity_filter: str | None = None) -> None:
+def convert_msconvert(raw_file: Path, out_dir: Path, msconvert: Path, polarity_filter: str | None = None, log: list[str] | None = None) -> None:
     ensure_dir(out_dir)
-    cmd = [
-        str(MSCONVERT),
-        str(raw_file),
-        "--mzML",
-        "--zlib",
-        "-v",
-        "--filter",
-        "peakPicking true 1-",
-    ]
+    cmd = [str(msconvert), str(raw_file), "--mzML", "--zlib", "-v"]
     if polarity_filter:
         cmd += ["--filter", f"polarity {polarity_filter}"]
+    cmd+=["peakPicking true 1-"]
     cmd += ["-o", str(out_dir), "--ignoreUnknownInstrumentError"]
-    print(f"  Converting (MSConvert): {raw_file.name}")
-    result = subprocess.run(cmd)
+    log_append(log, f"  Converting (MSConvert): {raw_file.name}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    for line in (result.stdout or "").splitlines():
+        log_append(log, f"    {line}")
+    for line in (result.stderr or "").splitlines():
+        log_append(log, f"    {line}")
     if result.returncode != 0:
-        print(f"  WARNING: Converter returned exit code {result.returncode} for '{raw_file.name}'")
+        log_append(log, f"  WARNING: Converter returned exit code {result.returncode} for '{raw_file.name}'")
 
 
-def fix_msms(mzml_file: Path, new_file_suffix: str, ppm_dev: float) -> None:
+def fix_msms(mzml_file: Path, new_file_suffix: str, ppm_dev: float, log: list[str] | None = None) -> Path:
+    """Fix MSMS precursors and return the (possibly renamed) output file path."""
     if not mzml_file.exists():
-        print(f"  WARNING: Expected output file not found, skipping MSMS fix: {mzml_file}")
-        return
-    print(f"  Fixing MSMS precursors: {mzml_file.name}")
+        log_append(log, f"  WARNING: Expected output file not found, skipping MSMS fix: {mzml_file}")
+        return mzml_file
+    log_append(log, f"  Fixing MSMS precursors: {mzml_file.name}")
     suffix = "" if new_file_suffix == "::SAME" else new_file_suffix
     try:
         correctWrongPrecursorInfo(str(mzml_file), new_file_suffix=suffix, ppm_dev=ppm_dev)
     except Exception as exc:
-        print(f"  WARNING: MSMS fix failed for '{mzml_file.name}': {exc}")
+        log_append(log, f"  WARNING: MSMS fix failed for '{mzml_file.name}': {exc}")
+        return mzml_file
+    if suffix:
+        new_path = mzml_file.parent / (mzml_file.stem + suffix + ".mzML")
+        try:
+            mzml_file.unlink()
+        except Exception as exc:
+            log_append(log, f"  WARNING: Could not remove original file '{mzml_file.name}': {exc}")
+        return new_path
+    return mzml_file
+
+
+def process_job(job: dict, log_callback: Callable[[str], None] | None = None) -> None:
+    """
+    Convert one raw file, optionally fix MSMS precursors, and optionally prefix
+    the output filename with the acquisition timestamp.  Thread-safe.
+    """
+    raw_file: Path = job["raw_file"]
+    out_dir: Path = job["out_dir"]
+    converter: str = job["converter"]
+    polarity_filter: str | None = job["polarity_filter"]
+    do_fix: bool = job["fix"]
+    newext: str = job["newext"]
+    ppm_dev: float = job["ppm_dev"]
+    label: str = job["label"]
+    thermoconvert: Path = job["thermoconvert"]
+    msconvert: Path = job["msconvert"]
+    add_timestamp_prefix: bool = job.get("add_timestamp_prefix", False)
+
+    log: list[str] = []
+
+    def _emit(msg: str) -> None:
+        log.append(msg)
+        if log_callback:
+            log_callback(msg)
+
+    _emit(f"[{label}] START: {raw_file.name}")
+
+    if converter == "thermo":
+        convert_thermo(raw_file, out_dir, thermoconvert, log=log)
+    else:
+        convert_msconvert(raw_file, out_dir, msconvert, polarity_filter=polarity_filter, log=log)
+
+    mzml_file = out_dir / (raw_file.stem + ".mzML")
+
+    if do_fix:
+        mzml_file = fix_msms(mzml_file, newext, ppm_dev, log=log)
+
+    if add_timestamp_prefix:
+        new_path = prefix_mzml_with_timestamp(mzml_file, log=log)
+        if new_path:
+            mzml_file = new_path
+
+    _emit(f"[{label}] DONE:  {raw_file.name}")
+
+    if not log_callback:
+        with _print_lock:
+            for line in log:
+                print(line)
+
+
+# ---------------------------------------------------------------------------
+# Build job list
+# ---------------------------------------------------------------------------
+
+
+def build_jobs(
+    raw_files: list[Path],
+    raw_data_folder: Path,
+    output_folder: Path,
+    converter: str,
+    exp_fps: bool,
+    exp_pos: bool,
+    exp_neg: bool,
+    do_fix: bool,
+    newext: str,
+    ppm_dev: float,
+    thermoconvert: Path,
+    msconvert: Path,
+    add_timestamp_prefix: bool,
+) -> list[dict]:
+    jobs: list[dict] = []
+    common = dict(
+        fix=do_fix,
+        newext=newext,
+        ppm_dev=ppm_dev,
+        thermoconvert=thermoconvert,
+        msconvert=msconvert,
+        add_timestamp_prefix=add_timestamp_prefix,
+    )
+
+    if converter == "thermo":
+        for raw_file in raw_files:
+            out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, "FPS")
+            jobs.append(dict(raw_file=raw_file, out_dir=out_dir, converter="thermo", polarity_filter=None, label="FPS", **common))
+    else:
+        modes: list[tuple[str, str | None]] = []
+        if exp_fps:
+            modes.append(("FPS", None))
+        if exp_pos:
+            modes.append(("pos", "positive"))
+        if exp_neg:
+            modes.append(("neg", "negative"))
+        for mode_dir, polarity in modes:
+            for raw_file in raw_files:
+                out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, mode_dir)
+                jobs.append(dict(raw_file=raw_file, out_dir=out_dir, converter="msconvert", polarity_filter=polarity, label=mode_dir, **common))
+
+    return jobs
+
+
+def filter_existing_jobs(jobs: list[dict]) -> tuple[list[dict], int]:
+    """Return (remaining_jobs, n_skipped) based on whether the output mzML exists."""
+
+    def _output_mzml(job: dict) -> Path:
+        stem = job["raw_file"].stem
+        if job["fix"] and job["newext"] != "::SAME":
+            return job["out_dir"] / (stem + job["newext"] + ".mzML")
+        return job["out_dir"] / (stem + ".mzML")
+
+    remaining = [j for j in jobs if not _output_mzml(j).exists()]
+    return remaining, len(jobs) - len(remaining)
+
+
+# ---------------------------------------------------------------------------
+# Top-level conversion runner (called by TUI)
+# ---------------------------------------------------------------------------
+
+
+def run_conversion(
+    raw_data_folder: Path,
+    output_folder: Path,
+    recursive: bool,
+    converter: str,
+    exp_fps: bool,
+    exp_pos: bool,
+    exp_neg: bool,
+    do_fix: bool,
+    newext: str,
+    ppm_dev: float,
+    skip_existing: bool,
+    n_threads: int,
+    thermo_version_idx: int,
+    msconvert_version_idx: int,
+    add_timestamp_prefix: bool,
+    log_callback: Callable[[str], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> None:
+    """Execute the full conversion pipeline."""
+
+    def _log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(msg)
+
+    thermoconvert, msconvert = get_tool_paths(thermo_version_idx, msconvert_version_idx)
+
+    missing = []
+    if not thermoconvert.exists():
+        missing.append(f"ThermoRawFileParser not found at: {thermoconvert}")
+    if converter == "msconvert" and not msconvert.exists():
+        missing.append(f"MSConvert not found at: {msconvert}")
+    if missing:
+        for m in missing:
+            _log(f"ERROR: {m}")
+        return
+
+    if output_folder.exists() and not skip_existing:
+        shutil.rmtree(output_folder)
+
+    raw_files = collect_raw_files(raw_data_folder, recursive)
+    if not raw_files:
+        _log("No .raw files found in the source folder.")
+        return
+
+    _log(f"Found {len(raw_files)} .raw file(s).")
+
+    jobs = build_jobs(
+        raw_files=raw_files,
+        raw_data_folder=raw_data_folder,
+        output_folder=output_folder,
+        converter=converter,
+        exp_fps=exp_fps,
+        exp_pos=exp_pos,
+        exp_neg=exp_neg,
+        do_fix=do_fix,
+        newext=newext,
+        ppm_dev=ppm_dev,
+        thermoconvert=thermoconvert,
+        msconvert=msconvert,
+        add_timestamp_prefix=add_timestamp_prefix,
+    )
+
+    if skip_existing:
+        jobs, skipped = filter_existing_jobs(jobs)
+        if skipped:
+            _log(f"Skipping {skipped} already-converted file(s).")
+
+    if not jobs:
+        _log("No files to process.")
+        return
+
+    _log(f"Processing {len(jobs)} job(s) with {n_threads} thread(s)...")
+
+    total = len(jobs)
+    completed_count = [0]
+    lock = threading.Lock()
+
+    def _run_job(job: dict) -> None:
+        process_job(job, log_callback=log_callback)
+        with lock:
+            completed_count[0] += 1
+            done = completed_count[0]
+            _log(f"Progress: {done}/{total} done")
+            if progress_callback:
+                progress_callback(done, total)
+
+    with ThreadPoolExecutor(max_workers=n_threads) as executor:
+        executor.map(_run_job, jobs)
+
+    _log("All done.")
+
+
+# ---------------------------------------------------------------------------
+# Version helper
+# ---------------------------------------------------------------------------
 
 
 def get_version() -> str:
-    # Get version from TOML file
     try:
-        version_info = toml.load(SCRIPT_DIR / "pyproject.toml")["project"]["version"]
-        return version_info
-    except Exception as exc:
-        print(f"Error retrieving version: {exc}")
+        return toml.load(SCRIPT_DIR / "pyproject.toml")["project"]["version"]
+    except Exception:
         return "unknown"
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Entry point — launch TUI
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    # --- Welcome message ---
-    print("Welcome to the Thermo Raw File Converter!")
-    print(" This utility helps you convert Thermo raw files to mzML format, with options to fix MSMS precursor information and separate polarity modes.")
-    print(f"Version: {get_version()}")
-    print()
+    from .tui import ConvertRawApp
 
-    # check for tools — offer to download when missing
-    def _check_and_offer_download() -> bool:
-        """Return True when both tools are present.  If any are missing, ask the
-        user whether they want to download them (informing them of the size),
-        then attempt the download and return True on success."""
-        missing: list[str] = []
-        if not THERMOCONVERT.exists():
-            missing.append("ThermoRawFileParser (~10 MB)")
-        if not MSCONVERT.exists():
-            missing.append("MSConvert / ProteoWizard (~190 MB)")
-
-        if not missing:
-            print(f"  [OK] ThermoRawFileParser: {THERMOCONVERT}")
-            print(f"  [OK] MSConvert: {MSCONVERT}")
-            return True
-
-        # Report what is missing
-        print()
-        print(SEP)
-        print("The following required tools were not found:")
-        for item in missing:
-            print(f"    - {item}")
-        total_note = "  Total download size: approximately 200 MB." if len(missing) == 2 else ""
-        if total_note:
-            print(total_note)
-        print()
-        print("  y - Download and install the missing tools automatically  [DEFAULT]")
-        print("  n - Quit (install them manually and re-run the program)")
-        choice = input("  [y/n] > ").strip().lower()
-        print()
-        if choice == "n":
-            print("Aborted. Please place the tools in the expected locations and re-run.")
-            print(f"  ThermoRawFileParser: {THERMOCONVERT}")
-            print(f"  MSConvert:           {MSCONVERT}")
-            input("\nPress Enter to exit.")
-            sys.exit(0)
-
-        # Download what is needed
-        ok = True
-        if not THERMOCONVERT.exists():
-            print()
-            if not _install_thermoconvert():
-                ok = False
-            else:
-                print(f"  [OK] ThermoRawFileParser: {THERMOCONVERT}")
-        if not MSCONVERT.exists():
-            print()
-            if not _install_msconvert():
-                ok = False
-            else:
-                print(f"  [OK] MSConvert: {MSCONVERT}")
-        return ok
-
-    while not _check_and_offer_download():
-        print(SEP)
-        print("Download/installation failed for one or more tools (see errors above).")
-        print("  r - Retry download")
-        print("  q - Quit")
-        choice = input("  [r/q] > ").strip().lower()
-        print()
-        if choice == "q":
-            sys.exit(1)
-        # else retry the loop
-
-    print("\n\n")
-    print(SEP)
-    print(" This script converts Thermo raw files to the mzML format.")
-    print(" It can correct incorrect MSMS precursor m/z values and separate")
-    print(" FPS data into positive and negative mode files.")
-    print(SEP)
-    print("\n\n")
-
-    # --- Source folder ---
-    print(SEP)
-    print("Which folder contains the raw data files?")
-    raw_data_folder = Path(_ask("..\\"))
-    print()
-
-    # --- Output folder ---
-    print(SEP)
-    print("Where should the converted mzML files be saved?")
-    output_folder = Path(_ask("..\\mzMLs"))
-    print()
-
-    # --- Recurse subfolders ---
-    print(SEP)
-    print("Should raw files in subfolders of the source folder also be converted?")
-    print("  The subfolder structure will be mirrored in the output directory.")
-    print("   y - Yes, recurse into all subfolders  [DEFAULT]")
-    print("   n - No, convert only top-level raw files")
-    recursive = _ask_choice(["y", "n"], "y") == "y"
-    print()
-
-    # --- Converter ---
-    print(SEP)
-    print("Which converter do you want to use for file conversion?")
-    print("   1 - ThermoRawFileParser (generates only FPS data)  [DEFAULT]")
-    print("   2 - MSConvert (can generate FPS, positive, and negative mode datasets)")
-    progc = _ask_choice(["1", "2"], "1")
-    print()
-
-    # --- Fix MSMS ---
-    print(SEP)
-    print("Do you want to fix the MSMS precursor information?")
-    print("   1 - Yes, fix the MSMS information  [DEFAULT]")
-    print("   2 - No, do not fix")
-    fix = _ask_choice(["1", "2"], "1") == "1"
-    print()
-
-    # --- New extension for fixed files ---
-    newext = "::SAME"
-    if fix:
-        print(SEP)
-        print("What file extension should be used for the MSMS-corrected files?")
-        print("   ::SAME - Overwrite original files  [DEFAULT]")
-        print("   <string> - Any A-z0-9_ string: append as new file extension")
-        newext_input = _ask("::SAME")
-        newext = newext_input if newext_input != "::SAME" or newext_input else "::SAME"
-        print()
-
-    # --- MSConvert mode selection ---
-    exp_fps, exp_pos, exp_neg = True, False, False
-    if progc == "2":
-        print(SEP)
-        print("Do you want to export the FPS data (all scans, no polarity separation)?")
-        print("   1 - Yes, export FPS data  [DEFAULT]")
-        print("   2 - No, do not export FPS data")
-        exp_fps = _ask_choice(["1", "2"], "1") == "1"
-        print()
-
-        print(SEP)
-        print("Do you want to export the positive mode data?")
-        print("   2 - No, do not export positive mode data  [DEFAULT]")
-        print("   1 - Yes, export positive mode data")
-        exp_pos = _ask_choice(["2", "1"], "2") == "1"
-        print()
-
-        print(SEP)
-        print("Do you want to export the negative mode data?")
-        print("   2 - No, do not export negative mode data  [DEFAULT]")
-        print("   1 - Yes, export negative mode data")
-        exp_neg = _ask_choice(["2", "1"], "2") == "1"
-        print()
-
-    # --- Collect files ---
-    raw_data_folder = raw_data_folder.resolve()
-    if not raw_data_folder.exists():
-        print(f"ERROR: Source folder '{raw_data_folder}' does not exist.")
-        sys.exit(1)
-
-    output_folder = output_folder.resolve()
-
-    # --- Output folder existence check ---
-    if output_folder.exists():
-        print(SEP)
-        print("WARNING: The output folder already exists:")
-        print(f"  {output_folder}")
-        print("  Continuing may mix old and new files.")
-        print("   y - Delete the existing output folder and continue  [DEFAULT]")
-        print("   n - Abort")
-        delete_choice = _ask_choice(["y", "n"], "y")
-        print()
-        if delete_choice == "y":
-            shutil.rmtree(output_folder)
-        else:
-            print("Aborted. Please remove the output folder manually or choose a different output folder when re-running the tool.")
-            input("\nPress Enter to exit.")
-            sys.exit(0)
-
-    ppm_dev = 1.0
-
-    raw_files = collect_raw_files(raw_data_folder, recursive)
-    if not raw_files:
-        suffix_note = " (including subfolders)" if recursive else ""
-        print(f"No .raw files found in '{raw_data_folder}'{suffix_note}.")
-        input("\nPress Enter to continue.")
-        sys.exit(0)
-
-    recurse_note = " (including subfolders)" if recursive else ""
-    print(f"\nFound {len(raw_files)} .raw file(s) in '{raw_data_folder}'{recurse_note}.\n")
-
-    # --- Convert ---
-    if progc == "1":
-        # ThermoRawFileParser — FPS only
-        print("\n\n")
-        print("Converting FPS data")
-        print("#" * 73)
-        for raw_file in raw_files:
-            out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, "FPS")
-            convert_thermo(raw_file, out_dir)
-            if fix:
-                mzml_file = out_dir / (raw_file.stem + ".mzML")
-                print("  Fixing wrong MSMS precursor information")
-                fix_msms(mzml_file, newext, ppm_dev)
-
-        print("\nAll done. If you need separate pos/neg mode data files, consider using the MSConvert option.")
-
-    else:
-        # MSConvert
-        if exp_fps:
-            print("\n\n")
-            print("Converting FPS data")
-            print("#" * 73)
-            for raw_file in raw_files:
-                out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, "FPS")
-                convert_msconvert(raw_file, out_dir, polarity_filter=None)
-                if fix:
-                    mzml_file = out_dir / (raw_file.stem + ".mzML")
-                    print("  Fixing wrong MSMS precursor information")
-                    fix_msms(mzml_file, newext, ppm_dev)
-
-        if exp_pos:
-            print("\n\n")
-            print("Converting positive mode data")
-            print("#" * 73)
-            for raw_file in raw_files:
-                out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, "pos")
-                convert_msconvert(raw_file, out_dir, polarity_filter="positive")
-                if fix:
-                    mzml_file = out_dir / (raw_file.stem + ".mzML")
-                    print("  Fixing wrong MSMS precursor information")
-                    fix_msms(mzml_file, newext, ppm_dev)
-
-        if exp_neg:
-            print("\n\n")
-            print("Converting negative mode data")
-            print("#" * 73)
-            for raw_file in raw_files:
-                out_dir = output_dir_for(raw_file, raw_data_folder, output_folder, "neg")
-                convert_msconvert(raw_file, out_dir, polarity_filter="negative")
-                if fix:
-                    mzml_file = out_dir / (raw_file.stem + ".mzML")
-                    print("  Fixing wrong MSMS precursor information")
-                    fix_msms(mzml_file, newext, ppm_dev)
-
-        print("\nAll done.")
-
-    input("\nPress Enter to continue.")
+    app = ConvertRawApp()
+    app.run()
 
 
 if __name__ == "__main__":
