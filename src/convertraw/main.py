@@ -11,6 +11,7 @@ from pathlib import Path
 
 import toml
 
+from .filterMZML import MzmlFilter, apply_mzml_filter  # noqa: E402
 from .fixMSMSPrecursor import correctWrongPrecursorInfo  # noqa: E402
 from .prefixTimestamp import prefix_mzml_with_timestamp  # noqa: E402
 
@@ -54,18 +55,18 @@ MSCONVERT_VERSIONS: list[dict] = [
         "exe_rel": "ProteoWizard-x86_64-vc145-release-3_0_26123_e5a25cb/msconvert.exe",
         "archive_type": "tar.bz2",
     },
-    #{
+    # {
     #    "label": "MSConvert / ProteoWizard 3.0.26102",
     #    "url": "https://mc-tca-01.s3.us-west-2.amazonaws.com/ProteoWizard/bt83/3934453/pwiz-bin-windows-x86_64-vc145-release-3_0_26102_0783ec5.tar.bz2",
     #    "exe_rel": "ProteoWizard-x86_64-vc145-release-3_0_26102_0783ec5/msconvert.exe",
     #    "archive_type": "tar.bz2",
-    #},
-    #{
+    # },
+    # {
     #    "label": "MSConvert / ProteoWizard 3.0.25149",
     #    "url": "https://mc-tca-01.s3.us-west-2.amazonaws.com/ProteoWizard/bt83/3813985/pwiz-bin-windows-x86_64-vc145-release-3_0_25149_2e8a3d7.tar.bz2",
     #    "exe_rel": "ProteoWizard-x86_64-vc145-release-3_0_25149_2e8a3d7/msconvert.exe",
     #    "archive_type": "tar.bz2",
-    #},
+    # },
 ]
 
 
@@ -204,7 +205,7 @@ def convert_msconvert(raw_file: Path, out_dir: Path, msconvert: Path, polarity_f
     cmd = [str(msconvert), str(raw_file), "--mzML", "--zlib", "-v"]
     if polarity_filter:
         cmd += ["--filter", f"polarity {polarity_filter}"]
-    cmd+=["peakPicking true 1-"]
+    cmd += ["peakPicking true 1-"]
     cmd += ["-o", str(out_dir), "--ignoreUnknownInstrumentError"]
     log_append(log, f"  Converting (MSConvert): {raw_file.name}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -254,6 +255,7 @@ def process_job(job: dict, log_callback: Callable[[str], None] | None = None) ->
     thermoconvert: Path = job["thermoconvert"]
     msconvert: Path = job["msconvert"]
     add_timestamp_prefix: bool = job.get("add_timestamp_prefix", False)
+    mzml_filter: MzmlFilter = job.get("mzml_filter", MzmlFilter())
 
     log: list[str] = []
 
@@ -278,6 +280,9 @@ def process_job(job: dict, log_callback: Callable[[str], None] | None = None) ->
         new_path = prefix_mzml_with_timestamp(mzml_file, log=log)
         if new_path:
             mzml_file = new_path
+
+    if mzml_filter.is_active():
+        apply_mzml_filter(mzml_file, mzml_filter, log=log)
 
     _emit(f"[{label}] DONE:  {raw_file.name}")
 
@@ -306,6 +311,7 @@ def build_jobs(
     thermoconvert: Path,
     msconvert: Path,
     add_timestamp_prefix: bool,
+    mzml_filter: MzmlFilter | None = None,
 ) -> list[dict]:
     jobs: list[dict] = []
     common = dict(
@@ -315,6 +321,7 @@ def build_jobs(
         thermoconvert=thermoconvert,
         msconvert=msconvert,
         add_timestamp_prefix=add_timestamp_prefix,
+        mzml_filter=mzml_filter or MzmlFilter(),
     )
 
     if converter == "thermo":
@@ -371,6 +378,7 @@ def run_conversion(
     thermo_version_idx: int,
     msconvert_version_idx: int,
     add_timestamp_prefix: bool,
+    mzml_filter: MzmlFilter | None = None,
     log_callback: Callable[[str], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
@@ -418,6 +426,7 @@ def run_conversion(
         thermoconvert=thermoconvert,
         msconvert=msconvert,
         add_timestamp_prefix=add_timestamp_prefix,
+        mzml_filter=mzml_filter,
     )
 
     if skip_existing:

@@ -37,6 +37,7 @@ from .main import (
     install_tool,
     run_conversion,
 )
+from .filterMZML import MzmlFilter
 
 # ---------------------------------------------------------------------------
 # CSS
@@ -215,6 +216,50 @@ Input:focus {
     height: auto;
     padding: 0;
 }
+
+/* Collision-energy min/max side-by-side */
+#ce-row {
+    height: auto;
+    align: left middle;
+}
+
+#ce-row Label {
+    width: auto;
+    padding: 0 1 0 2;
+}
+
+#ce-row Input {
+    width: 14;
+}
+
+/* Exact CE values */
+#ce-exact-row {
+    height: auto;
+    align: left middle;
+}
+
+#ce-exact-row Label {
+    width: auto;
+    padding: 0 1 0 2;
+}
+
+#ce-exact-row Input {
+    width: 40;
+}
+
+/* Filter-string preset buttons */
+#filter-preset-row {
+    height: auto;
+    align: left middle;
+    padding: 0 0 0 2;
+}
+
+.filter-preset-btn {
+    min-width: 12;
+    margin: 0 1 0 0;
+    background: $surface-lighten-1;
+    color: $text;
+}
 """
 
 
@@ -331,6 +376,51 @@ class ConvertRawApp(App):
             yield Rule()
 
             # ----------------------------------------------------------------
+            # Spectrum filters (post-conversion mzML)
+            # ----------------------------------------------------------------
+            yield Static("🔍  Spectrum Filters  (post-conversion mzML)", classes="section-title")
+            yield Static(
+                "Applied after conversion. All active criteria are combined with AND logic. Spectra that do not satisfy all active criteria are removed from the output mzML.",
+                classes="hint",
+            )
+
+            yield Static("Scan polarity (applies to all MS levels):", classes="hint")
+            with RadioSet(id="rs-filter-polarity"):
+                yield RadioButton("All polarities  [default]", value=True, id="rb-filter-pol-all")
+                yield RadioButton("Positive scans only", id="rb-filter-pol-pos")
+                yield RadioButton("Negative scans only", id="rb-filter-pol-neg")
+
+            yield Static("MS levels to keep (unchecked = keep all):", classes="hint")
+            yield Checkbox("Keep MS1 scans", id="cb-filter-ms1", value=False)
+            yield Checkbox("Keep MS2 scans", id="cb-filter-ms2", value=False)
+
+            yield Static("Collision energy filter (eV):", classes="hint")
+            yield Static("  Range (blank = no limit):", classes="hint")
+            with Horizontal(id="ce-row"):
+                yield Label("Min:")
+                yield Input(placeholder="e.g. 20", id="inp-ce-min", value="")
+                yield Label("Max:")
+                yield Input(placeholder="e.g. 60", id="inp-ce-max", value="")
+            yield Static("  Exact values — semicolon-separated list (blank = no filter):", classes="hint")
+            with Horizontal(id="ce-exact-row"):
+                yield Label("Values:")
+                yield Input(placeholder="e.g. 35;45;60", id="inp-ce-values", value="")
+
+            yield Label("Filter string regex (blank = no filter):")
+            yield Static("  Presets:", classes="hint")
+            with Horizontal(id="filter-preset-row"):
+                yield Button("FTMS.*", id="btn-preset-ftms", classes="filter-preset-btn")
+                yield Button("ITMS.*", id="btn-preset-itms", classes="filter-preset-btn")
+                yield Button("ms2.*", id="btn-preset-ms2", classes="filter-preset-btn")
+                yield Button("Clear", id="btn-preset-clear", classes="filter-preset-btn")
+            yield Input(
+                placeholder=r"e.g.  FTMS.*",
+                id="inp-filter-regex",
+                value="",
+            )
+            yield Rule()
+
+            # ----------------------------------------------------------------
             # Parallelism
             # ----------------------------------------------------------------
             yield Static("⚡  Parallelism", classes="section-title")
@@ -421,6 +511,14 @@ class ConvertRawApp(App):
             self._download_tool("thermo")
         elif event.button.id == "btn-download-msconvert":
             self._download_tool("msconvert")
+        elif event.button.id == "btn-preset-ftms":
+            self.query_one("#inp-filter-regex", Input).value = "FTMS.*"
+        elif event.button.id == "btn-preset-itms":
+            self.query_one("#inp-filter-regex", Input).value = "ITMS.*"
+        elif event.button.id == "btn-preset-ms2":
+            self.query_one("#inp-filter-regex", Input).value = "ms2.*"
+        elif event.button.id == "btn-preset-clear":
+            self.query_one("#inp-filter-regex", Input).value = ""
 
     # ------------------------------------------------------------------
     # Folder scan
@@ -534,6 +632,56 @@ class ConvertRawApp(App):
 
         add_timestamp = self.query_one("#cb-timestamp", Checkbox).value
 
+        # --- Spectrum filters ---
+        pol_idx = self._selected_index("rs-filter-polarity")
+        filter_polarity: str | None = None
+        if pol_idx == 1:
+            filter_polarity = "positive"
+        elif pol_idx == 2:
+            filter_polarity = "negative"
+
+        filter_ms_levels: set[int] = set()
+        if self.query_one("#cb-filter-ms1", Checkbox).value:
+            filter_ms_levels.add(1)
+        if self.query_one("#cb-filter-ms2", Checkbox).value:
+            filter_ms_levels.add(2)
+
+        def _parse_float(widget_id: str) -> float | None:
+            raw = self.query_one(widget_id, Input).value.strip()
+            if not raw:
+                return None
+            try:
+                return float(raw)
+            except ValueError:
+                self._log(f"[yellow]WARNING: Invalid number in {widget_id}, ignoring.[/yellow]")
+                return None
+
+        filter_ce_min = _parse_float("#inp-ce-min")
+        filter_ce_max = _parse_float("#inp-ce-max")
+
+        filter_ce_values: set[float] = set()
+        ce_values_raw = self.query_one("#inp-ce-values", Input).value.strip()
+        if ce_values_raw:
+            for part in ce_values_raw.split(";"):
+                part = part.strip()
+                if part:
+                    try:
+                        filter_ce_values.add(float(part))
+                    except ValueError:
+                        self._log(f"[yellow]WARNING: Invalid CE value '{part}', ignoring.[/yellow]")
+
+        filter_regex_raw = self.query_one("#inp-filter-regex", Input).value.strip()
+        filter_string_regex: str | None = filter_regex_raw if filter_regex_raw else None
+
+        mzml_filter = MzmlFilter(
+            polarity=filter_polarity,
+            ms_levels=filter_ms_levels,
+            ce_min=filter_ce_min,
+            ce_max=filter_ce_max,
+            ce_values=filter_ce_values,
+            filter_string_regex=filter_string_regex,
+        )
+
         threads_raw = self.query_one("#inp-threads", Input).value.strip()
         try:
             n_threads = max(1, int(threads_raw))
@@ -580,6 +728,7 @@ class ConvertRawApp(App):
                 thermo_version_idx=thermo_ver_idx,
                 msconvert_version_idx=msconvert_ver_idx,
                 add_timestamp_prefix=add_timestamp,
+                mzml_filter=mzml_filter,
                 log_callback=self._log,
                 progress_callback=self._update_progress,
             )
